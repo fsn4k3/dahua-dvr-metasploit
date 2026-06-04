@@ -554,6 +554,22 @@ class MetasploitModule < Msf::Auxiliary
     http_probe(ip) if datastore['HTTP_FALLBACK']
   end
 
+  # Safe credential helper — guards against DB disconnection mid-scan.
+  # create_credential returns nil when DB is inactive; calling .id on nil
+  # caused NoMethodError crashes in long scans. This method checks both
+  # that the DB is active and that the credential object is not nil.
+  def safe_report_cred(credential_data, service_data)
+    return unless framework.db&.active
+    credential = create_credential(credential_data)
+    return unless credential
+    create_credential_login({
+      core:   credential,
+      status: Metasploit::Model::Login::Status::UNTRIED
+    }.merge(service_data))
+  rescue ::StandardError => e
+    vprint_error("Failed to save credential: #{e.message}")
+  end
+
   def report_hash(rhost, rport, user, hash)
     service_data = {
       address:      rhost,
@@ -567,13 +583,10 @@ class MetasploitModule < Msf::Auxiliary
       origin_type:     :service,
       private_data:    hash,
       private_type:    :nonreplayable_hash,
-      jtr_format:      'dahua',  # FIX #12: was 'dahua_hash' which is not a valid JTR/hashcat format
+      jtr_format:      'dahua',
       username:        user
     }.merge(service_data)
-    create_credential_login({
-      core:   create_credential(credential_data),
-      status: Metasploit::Model::Login::Status::UNTRIED
-    }.merge(service_data))
+    safe_report_cred(credential_data, service_data)
   end
 
   def report_ddns_cred(server, port, user, pass)
@@ -591,10 +604,7 @@ class MetasploitModule < Msf::Auxiliary
       private_type:    :password,
       username:        user
     }.merge(service_data)
-    create_credential_login({
-      core:   create_credential(credential_data),
-      status: Metasploit::Model::Login::Status::UNTRIED
-    }.merge(service_data))
+    safe_report_cred(credential_data, service_data)
   end
 
   def report_email_cred(server, port, user, pass)
@@ -612,13 +622,9 @@ class MetasploitModule < Msf::Auxiliary
       private_type:    :password,
       username:        user
     }.merge(service_data)
-    create_credential_login({
-      core:   create_credential(credential_data),
-      status: Metasploit::Model::Login::Status::UNTRIED
-    }.merge(service_data))
+    safe_report_cred(credential_data, service_data)
   end
 
-  # FIX #6: new method replacing the non-existent report_creds call in grab_nas
   def report_nas_cred(server, port, user, pass)
     service_data = {
       address:      server,
@@ -634,9 +640,24 @@ class MetasploitModule < Msf::Auxiliary
       private_type:    :password,
       username:        user
     }.merge(service_data)
-    create_credential_login({
-      core:   create_credential(credential_data),
-      status: Metasploit::Model::Login::Status::UNTRIED
-    }.merge(service_data))
+    safe_report_cred(credential_data, service_data)
+  end
+
+  def report_http_cred(ip, port, user, pass)
+    service_data = {
+      address:      ip,
+      port:         port,
+      service_name: datastore['HTTP_SSL'] ? 'https' : 'http',
+      protocol:     'tcp',
+      workspace_id: myworkspace_id
+    }
+    credential_data = {
+      module_fullname: fullname,
+      origin_type:     :service,
+      private_data:    pass,
+      private_type:    :password,
+      username:        user
+    }.merge(service_data)
+    safe_report_cred(credential_data, service_data)
   end
 end
