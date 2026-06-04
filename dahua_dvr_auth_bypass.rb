@@ -107,13 +107,16 @@ class MetasploitModule < Msf::Auxiliary
   def check_host(_ip)
     connect
     sock.put(U1)
-    data = sock.recv(8)
-    if data == DVR_RESP
+    # Use get_once with timeout so devices that accept TCP but never send
+    # data don't block the thread indefinitely (sock.recv has no timeout)
+    data = sock.get_once(-1, datastore['TIMEOUT'])
+    if data && data[0, 8] == DVR_RESP
       Exploit::CheckCode::Appears
     else
       Exploit::CheckCode::Safe
     end
-  rescue ::Rex::ConnectionError, ::EOFError, ::Errno::ECONNRESET
+  rescue ::Rex::ConnectionError, ::EOFError, ::Errno::ECONNRESET,
+         ::Rex::TimeoutError, ::Timeout::Error
     Exploit::CheckCode::Unknown
   ensure
     disconnect
@@ -122,9 +125,13 @@ class MetasploitModule < Msf::Auxiliary
   def dahua_fingerprint
     connect
     sock.put(U1)
-    data = sock.recv(8)
-    data == DVR_RESP
-  rescue ::Rex::ConnectionError, ::EOFError, ::Errno::ECONNRESET => e
+    # Use get_once with timeout so devices that accept TCP but never send
+    # data don't block the thread indefinitely (sock.recv has no timeout)
+    data = sock.get_once(-1, datastore['TIMEOUT'])
+    return false unless data
+    data[0, 8] == DVR_RESP
+  rescue ::Rex::ConnectionError, ::EOFError, ::Errno::ECONNRESET,
+         ::Rex::TimeoutError, ::Timeout::Error => e
     vprint_error("#{peer} -- connection error: #{e.message}")
     false
   ensure
