@@ -84,9 +84,9 @@ class MetasploitModule < Msf::Auxiliary
     sock.get_once(-1, datastore['TIMEOUT'])
   end
 
-  # FIX #7: proper check method so `check` command works before running
+  # FIX #7: scanner auxiliary modules use check_host (not check) for per-host check support
   # FIX #8: fingerprint uses its own connect/disconnect, not shared with action methods
-  def check
+  def check_host(_ip)
     connect
     sock.put(U1)
     data = sock.recv(8)
