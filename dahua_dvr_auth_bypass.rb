@@ -535,6 +535,9 @@ class MetasploitModule < Msf::Auxiliary
   # This eliminates the double-connect issue where run_host's ensure disconnect could fire
   # while an action method's socket was still open.
   def run_host(ip)
+    # Record every scanned host so hosts table can be used for progress tracking
+    report_host(host: ip)
+
     # TCP binary protocol (CVE-2013-6117, port 37777)
     if dahua_fingerprint
       print_good("#{peer} -- Dahua DVR found (TCP/#{rport})")
